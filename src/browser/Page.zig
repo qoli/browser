@@ -276,6 +276,63 @@ fn registerBackgroundTasks(self: *Page) !void {
     }.runMessageLoop, 250, .{ .name = "page.messageLoop" });
 }
 
+pub fn navigateFromWebAPI(self: *Page, request_url: [:0]const u8, opts: NavigateOpts, kind: NavigationKind) !void {
+    const session = self._session;
+    const resolved_url = try URL.resolve(
+        session.transfer_arena,
+        self.url,
+        request_url,
+        .{ .always_dupe = true },
+    );
+
+    // setting opts.force = true will force a page load.
+    // otherwise, we will need to ensure this is a true (not document) navigation.
+    if (!opts.force) {
+        // If we are navigating within the same document, just change URL.
+        if (URL.eqlDocument(self.url, resolved_url)) {
+            // update page url
+            self.url = resolved_url;
+
+            // update location
+            self.window._location = try Location.init(self.url, self);
+            self.document._location = self.window._location;
+
+            try session.navigation.updateEntries(resolved_url, kind, self, true);
+            return;
+        }
+    }
+
+    if (session.queued_navigation != null) {
+        // It might seem like this should never happen. And it might not,
+        // BUT..consider the case where we have script like:
+        //   top.location = X;
+        //   top.location = Y;
+        // Will the 2nd top.location execute? You'd think not, since,
+        // when we're in this function for the 1st, we'll call:
+        //    session.executor.terminateExecution();
+        // But, this doesn't seem guaranteed to stop on the current line.
+        // My best guess is that v8 groups executes in chunks (how they are
+        // chunked, I can't guess) and always executes them together.
+        return;
+    }
+
+    log.debug(.browser, "delayed navigation", .{
+        .url = resolved_url,
+        .reason = opts.reason,
+    });
+
+    session.queued_navigation = .{
+        .opts = opts,
+        .url = resolved_url,
+    };
+
+    const http_client = self._session.browser.http_client;
+    http_client.abort();
+
+    // In v8, this throws an exception which JS code cannot catch.
+    session.executor.terminateExecution();
+}
+
 pub fn navigate(self: *Page, request_url: [:0]const u8, opts: NavigateOpts, kind: NavigationKind) !void {
     const session = self._session;
 
