@@ -45,6 +45,11 @@ pub fn toString(self: Value, allocator: Allocator) ![]const u8 {
     return self.context.valueToString(self.js_val, .{ .allocator = allocator });
 }
 
+pub fn toJson(self: Value, allocator: Allocator) ![]const u8 {
+    const v8_str = try v8.Json.stringify(self.context.v8_context, self.js_val, null);
+    return self.context.jsStringToZig(v8_str, .{ .allocator = allocator });
+}
+
 pub fn fromJson(ctx: *js.Context, json: []const u8) !Value {
     const json_string = v8.String.initUtf8(ctx.isolate, json);
     const value = try v8.Json.parse(ctx.v8_context, json_string);

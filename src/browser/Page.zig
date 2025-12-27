@@ -71,6 +71,8 @@ const Page = @This();
 
 _session: *Session,
 
+_operator: ?Operator = null,
+
 _event_manager: EventManager,
 
 _parse_mode: enum { document, fragment, document_write },
@@ -251,7 +253,7 @@ fn reset(self: *Page, comptime initializing: bool) !void {
     self._script_manager = ScriptManager.init(self);
     errdefer self._script_manager.deinit();
 
-    self.js = try self._session.executor.createContext(self, true);
+    self.js = try self._session.executor.createContext(self);
     errdefer self.js.deinit();
 
     self._element_styles = .{};
@@ -741,7 +743,7 @@ fn _wait(self: *Page, wait_ms: u32) !Session.WaitResult {
     var scheduler = &self.scheduler;
     var http_client = self._session.browser.http_client;
 
-    // I'd like the page to know NOTHING about cdp_socket / CDP, but the
+    // I'd like the page to know NOTHING about operator_socket / CDP, but the
     // fact is that the behavior of wait changes depending on whether or
     // not we're using CDP.
     // If we aren't using CDP, as soon as we think there's nothing left
@@ -751,7 +753,7 @@ fn _wait(self: *Page, wait_ms: u32) !Session.WaitResult {
     // we could let CDP poll http (like it does for HTTP requests), the fact
     // is that we know more about the timing of stuff (e.g. how long to
     // poll/sleep) in the page.
-    const exit_when_done = http_client.cdp_client == null;
+    const exit_when_done = http_client.operator == null;
 
     // for debugging
     // defer self.printWaitAnalysis();
@@ -759,6 +761,10 @@ fn _wait(self: *Page, wait_ms: u32) !Session.WaitResult {
     while (true) {
         switch (self._parse_state) {
             .pre, .raw, .text => {
+                if (self._queued_navigation != null) {
+                    return .navigate;
+                }
+
                 // The main page hasn't started/finished navigating.
                 // There's no JS to run, and no reason to run the scheduler.
                 if (http_client.active == 0 and exit_when_done) {
@@ -768,15 +774,15 @@ fn _wait(self: *Page, wait_ms: u32) !Session.WaitResult {
                 // Either we have active http connections, or we're in CDP
                 // mode with an extra socket. Either way, we're waiting
                 // for http traffic
-                if (try http_client.tick(@intCast(ms_remaining)) == .cdp_socket) {
+                if (try http_client.tick(@intCast(ms_remaining)) == .operator_socket) {
                     // exit_when_done is explicitly set when there isn't
                     // an extra socket, so it should not be possibl to
-                    // get an cdp_socket message when exit_when_done
+                    // get an operator_socket message when exit_when_done
                     // is true.
                     std.debug.assert(exit_when_done == false);
 
                     // data on a socket we aren't handling, return to caller
-                    return .cdp_socket;
+                    return .operator_socket;
                 }
             },
             .html, .complete => {
@@ -844,13 +850,13 @@ fn _wait(self: *Page, wait_ms: u32) !Session.WaitResult {
                 } else {
                     // We're here because we either have active HTTP
                     // connections, or exit_when_done == false (aka, there's
-                    // an cdp_socket registered with the http client).
+                    // an operator_socket registered with the http client).
                     // We should continue to run lowPriority tasks, so we
                     // minimize how long we'll poll for network I/O.
                     const ms_to_wait = @min(200, @min(ms_remaining, ms_to_next_task orelse 200));
-                    if (try http_client.tick(ms_to_wait) == .cdp_socket) {
+                    if (try http_client.tick(ms_to_wait) == .operator_socket) {
                         // data on a socket we aren't handling, return to caller
-                        return .cdp_socket;
+                        return .operator_socket;
                     }
                 }
             },
@@ -2583,6 +2589,16 @@ pub fn requestCookie(self: *const Page, opts: RequestCookieOpts) Http.Client.Req
         .is_navigation = opts.is_navigation,
     };
 }
+
+pub fn sendToOperator(self: *const Page, data: []const u8) !void {
+    const operator = self._operator orelse return error.NoOperator;
+    return operator.send(operator.ctx, data);
+}
+
+const Operator = struct {
+    ctx: *anyopaque,
+    send: *const fn (ctx: *anyopaque, data: []const u8) error{ SendError, WriteFailed, OutOfMemory }!void,
+};
 
 fn asUint(comptime string: anytype) std.meta.Int(
     .unsigned,

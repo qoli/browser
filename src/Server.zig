@@ -27,7 +27,6 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const log = @import("log.zig");
 const App = @import("App.zig");
-const CDP = @import("cdp/cdp.zig").CDP;
 
 const MAX_HTTP_REQUEST_SIZE = 4096;
 
@@ -42,20 +41,15 @@ shutdown: bool,
 allocator: Allocator,
 client: ?posix.socket_t,
 listener: ?posix.socket_t,
-json_version_response: []const u8,
 
-pub fn init(app: *App, address: net.Address) !Server {
+pub fn init(app: *App) !Server {
     const allocator = app.allocator;
-    const json_version_response = try buildJSONVersionResponse(allocator, address);
-    errdefer allocator.free(json_version_response);
-
     return .{
         .app = app,
         .client = null,
         .listener = null,
         .shutdown = false,
         .allocator = allocator,
-        .json_version_response = json_version_response,
     };
 }
 
@@ -64,9 +58,6 @@ pub fn deinit(self: *Server) void {
     if (self.listener) |listener| {
         posix.close(listener);
     }
-    // *if* server.run is running, we should really wait for it to return
-    // before existing from here.
-    self.allocator.free(self.json_version_response);
 }
 
 pub fn run(self: *Server, address: net.Address, timeout_ms: u32) !void {
@@ -88,7 +79,7 @@ pub fn run(self: *Server, address: net.Address, timeout_ms: u32) !void {
             if (self.shutdown) {
                 return;
             }
-            log.err(.app, "CDP accept", .{ .err = err });
+            log.err(.app, "WS accept", .{ .err = err });
             std.Thread.sleep(std.time.ns_per_s);
             continue;
         };
@@ -107,7 +98,7 @@ pub fn run(self: *Server, address: net.Address, timeout_ms: u32) !void {
         }
 
         self.readLoop(socket, timeout_ms) catch |err| {
-            log.err(.app, "CDP client loop", .{ .err = err });
+            log.err(.app, "WS client loop", .{ .err = err });
         };
     }
 }
@@ -123,19 +114,15 @@ fn readLoop(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
     defer client.deinit();
 
     var http = &self.app.http;
-    http.addCDPClient(.{
+    http.addOperator(.{
         .socket = socket,
-        .ctx = client,
-        .blocking_read_start = Client.blockingReadStart,
-        .blocking_read = Client.blockingRead,
-        .blocking_read_end = Client.blockingReadStop,
     });
-    defer http.removeCDPClient();
+    defer http.removeOperator();
 
     std.debug.assert(client.mode == .http);
     while (true) {
-        if (http.poll(timeout_ms) != .cdp_socket) {
-            log.info(.app, "CDP timeout", .{});
+        if (http.poll(timeout_ms) != .operator_socket) {
+            log.info(.app, "WS timeout", .{});
             return;
         }
 
@@ -143,17 +130,17 @@ fn readLoop(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
             return;
         }
 
-        if (client.mode == .cdp) {
-            break; // switch to our CDP loop
+        if (client.mode == .websocket) {
+            break; // switch to our WS loop
         }
     }
 
-    var cdp = &client.mode.cdp;
+    var ws = &client.mode.websocket;
     var last_message = timestamp(.monotonic);
     var ms_remaining = timeout_ms;
     while (true) {
-        switch (cdp.pageWait(ms_remaining)) {
-            .cdp_socket => {
+        switch (ws.session().wait(ms_remaining)) {
+            .operator_socket => {
                 if (client.readSocket() == false) {
                     return;
                 }
@@ -161,8 +148,8 @@ fn readLoop(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
                 ms_remaining = timeout_ms;
             },
             .no_page => {
-                if (http.poll(ms_remaining) != .cdp_socket) {
-                    log.info(.app, "CDP timeout", .{});
+                if (http.poll(ms_remaining) != .operator_socket) {
+                    log.info(.app, "WS timeout", .{});
                     return;
                 }
                 if (client.readSocket() == false) {
@@ -174,7 +161,7 @@ fn readLoop(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
             .done => {
                 const elapsed = timestamp(.monotonic) - last_message;
                 if (elapsed > ms_remaining) {
-                    log.info(.app, "CDP timeout", .{});
+                    log.info(.app, "WS timeout", .{});
                     return;
                 }
                 ms_remaining -= @intCast(elapsed);
@@ -184,12 +171,12 @@ fn readLoop(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
     }
 }
 
-pub const Client = struct {
+const Client = struct {
     // The client is initially serving HTTP requests but, under normal circumstances
     // should eventually be upgraded to a websocket connections
     mode: union(enum) {
-        http: void,
-        cdp: CDP,
+        http,
+        websocket: State,
     },
 
     server: *Server,
@@ -228,44 +215,21 @@ pub const Client = struct {
 
     fn deinit(self: *Client) void {
         switch (self.mode) {
-            .cdp => |*cdp| cdp.deinit(),
             .http => {},
+            .websocket => |*session| session.deinit(),
         }
         self.reader.deinit();
         self.send_arena.deinit();
     }
 
-    fn blockingReadStart(ctx: *anyopaque) bool {
-        const self: *Client = @ptrCast(@alignCast(ctx));
-        _ = posix.fcntl(self.socket, posix.F.SETFL, self.socket_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch |err| {
-            log.warn(.app, "CDP blockingReadStart", .{ .err = err });
-            return false;
-        };
-        return true;
-    }
-
-    fn blockingRead(ctx: *anyopaque) bool {
-        const self: *Client = @ptrCast(@alignCast(ctx));
-        return self.readSocket();
-    }
-
-    fn blockingReadStop(ctx: *anyopaque) bool {
-        const self: *Client = @ptrCast(@alignCast(ctx));
-        _ = posix.fcntl(self.socket, posix.F.SETFL, self.socket_flags) catch |err| {
-            log.warn(.app, "CDP blockingReadStop", .{ .err = err });
-            return false;
-        };
-        return true;
-    }
-
     fn readSocket(self: *Client) bool {
         const n = posix.read(self.socket, self.readBuf()) catch |err| {
-            log.warn(.app, "CDP read", .{ .err = err });
+            log.warn(.app, "WS read", .{ .err = err });
             return false;
         };
 
         if (n == 0) {
-            log.info(.app, "CDP disconnect", .{});
+            log.info(.app, "WS disconnect", .{});
             return false;
         }
 
@@ -280,8 +244,8 @@ pub const Client = struct {
         self.reader.len += len;
 
         switch (self.mode) {
-            .cdp => |*cdp| return self.processWebsocketMessage(cdp),
             .http => return self.processHTTPRequest(),
+            .websocket => |*session| return self.processWebsocketMessage(session),
         }
     }
 
@@ -339,18 +303,6 @@ pub const Client = struct {
         if (std.mem.eql(u8, url, "/")) {
             try self.upgradeConnection(request);
             return true;
-        }
-
-        if (std.mem.eql(u8, url, "/json/version")) {
-            try self.send(self.server.json_version_response);
-            // Chromedp (a Go driver) does an http request to /json/version
-            // then to / (websocket upgrade) using a different connection.
-            // Since we only allow 1 connection at a time, the 2nd one (the
-            // websocket upgrade) blocks until the first one times out.
-            // We can avoid that by closing the connection. json_version_response
-            // has a Connection: Close header too.
-            try posix.shutdown(self.socket, .recv);
-            return false;
         }
 
         return error.NotFound;
@@ -447,7 +399,14 @@ pub const Client = struct {
             break :blk res;
         };
 
-        self.mode = .{ .cdp = try CDP.init(self.server.app, self) };
+        self.mode = .{ .websocket = try State.init(self.server.app) };
+        errdefer self.mode.websocket.deinit();
+
+        self.mode.websocket.page()._operator = .{
+            .ctx = self,
+            .send = sendFromCtx,
+        };
+
         return self.send(response);
     }
 
@@ -462,7 +421,7 @@ pub const Client = struct {
         self.send(response) catch {};
     }
 
-    fn processWebsocketMessage(self: *Client, cdp: *CDP) !bool {
+    fn processWebsocketMessage(self: *Client, state: *State) !bool {
         var reader = &self.reader;
         while (true) {
             const msg = reader.next() catch |err| {
@@ -479,15 +438,72 @@ pub const Client = struct {
                 return err;
             } orelse break;
 
-            switch (msg.type) {
+            blk: switch (msg.type) {
                 .pong => {},
                 .ping => try self.sendPong(msg.data),
                 .close => {
                     self.send(&CLOSE_NORMAL) catch {};
                     return false;
                 },
-                .text, .binary => if (cdp.handleMessage(msg.data) == false) {
-                    return false;
+                .text, .binary => {
+                    const send_allocator = self.send_arena.allocator();
+
+                    const input = std.json.parseFromSliceLeaky(std.json.Value, send_allocator, msg.data, .{}) catch |err| {
+                        try self.sendJSON(.{ .err = @errorName(err) }, .{});
+                        break :blk;
+                    };
+
+                    if (input != .object) {
+                        try self.sendJSON(.{ .err = "invalid input" }, .{});
+                        break :blk;
+                    }
+                    const obj = input.object;
+                    const cmd = obj.get("cmd") orelse {
+                        try self.sendJSON(.{ .err = "missing 'cmd' field" }, .{});
+                        break :blk;
+                    };
+                    if (cmd != .string) {
+                        try self.sendJSON(.{ .err = "invalid 'cmd' field" }, .{});
+                        break :blk;
+                    }
+                    log.info(.cdp, "input", .{ .cmd = cmd.string });
+
+                    const page = state.page();
+                    const js = page.js;
+                    if (std.mem.eql(u8, cmd.string, "navigate")) {
+                        const url = obj.get("url") orelse {
+                            try self.sendJSON(.{ .err = "missing 'url' field" }, .{});
+                            break :blk;
+                        };
+                        if (url != .string) {
+                            try self.sendJSON(.{ .err = "invalid 'url' field" }, .{});
+                            break :blk;
+                        }
+
+                        try page.navigate(try send_allocator.dupeZ(u8, url.string), .{});
+                        break :blk;
+                    }
+
+                    if (std.mem.eql(u8, cmd.string, "eval")) {
+                        const script = obj.get("script") orelse {
+                            try self.sendJSON(.{ .err = "missing 'script' field" }, .{});
+                            break :blk;
+                        };
+                        if (script != .string) {
+                            try self.sendJSON(.{ .err = "invalid 'script' field" }, .{});
+                            break :blk;
+                        }
+                        var try_catch: @import("browser/js/js.zig").TryCatch = undefined;
+                        try_catch.init(js);
+                        defer try_catch.deinit();
+
+                        page.js.eval(script.string, null) catch |err| {
+                            const err_string = try_catch.err(send_allocator) catch @errorName(err) orelse "unknown";
+                            try self.sendJSON(.{ .err = err_string }, .{});
+                        };
+                        page.js.runMicrotasks();
+                        break :blk;
+                    }
                 },
             }
             if (msg.cleanup_fragment) {
@@ -515,13 +531,18 @@ pub const Client = struct {
         return self.send(framed);
     }
 
-    // called by CDP
-    // Websocket frames have a variable length header. For server-client,
-    // it could be anywhere from 2 to 10 bytes. Our IO.Loop doesn't have
-    // writev, so we need to get creative. We'll JSON serialize to a
-    // buffer, where the first 10 bytes are reserved. We can then backfill
-    // the header and send the slice.
-    pub fn sendJSON(self: *Client, message: anytype, opts: std.json.Stringify.Options) !void {
+    fn sendFromCtx(ctx: *anyopaque, message: []const u8) !void {
+        const self: *Client = @ptrCast(@alignCast(ctx));
+        const allocator = self.send_arena.allocator();
+
+        var aw = try std.Io.Writer.Allocating.initCapacity(allocator, message.len + 10);
+        try aw.writer.writeAll(&.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        try aw.writer.writeAll(message);
+        const framed = fillWebsocketHeader(aw.toArrayList());
+        return self.send(framed) catch error.SendError;
+    }
+
+    fn sendJSON(self: *Client, message: anytype, opts: std.json.Stringify.Options) !void {
         const allocator = self.send_arena.allocator();
 
         var aw = try std.Io.Writer.Allocating.initCapacity(allocator, 512);
@@ -530,16 +551,6 @@ pub const Client = struct {
         try aw.writer.writeAll(&.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
         try std.json.Stringify.value(message, opts, &aw.writer);
         const framed = fillWebsocketHeader(aw.toArrayList());
-        return self.send(framed);
-    }
-
-    pub fn sendJSONRaw(
-        self: *Client,
-        buf: std.ArrayListUnmanaged(u8),
-    ) !void {
-        // Dangerous API!. We assume the caller has reserved the first 10
-        // bytes in `buf`.
-        const framed = fillWebsocketHeader(buf);
         return self.send(framed);
     }
 
@@ -552,7 +563,7 @@ pub const Client = struct {
             // We had to change our socket to blocking me to get our write out
             // We need to change it back to non-blocking.
             _ = posix.fcntl(self.socket, posix.F.SETFL, self.socket_flags) catch |err| {
-                log.err(.app, "CDP restore nonblocking", .{ .err = err });
+                log.err(.app, "WS restore nonblocking", .{ .err = err });
             };
         };
 
@@ -568,7 +579,7 @@ pub const Client = struct {
                     // is complete. Doesn't seem particularly efficiently, but
                     // this should virtually never happen.
                     std.debug.assert(changed_to_blocking == false);
-                    log.debug(.app, "CDP write would block", .{});
+                    log.debug(.app, "WS write would block", .{});
                     changed_to_blocking = true;
                     _ = try posix.fcntl(self.socket, posix.F.SETFL, self.socket_flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
                     continue :LOOP;
@@ -581,6 +592,39 @@ pub const Client = struct {
             }
             pos += written;
         }
+    }
+};
+
+const State = struct {
+    const Browser = @import("browser/Browser.zig");
+    browser: *Browser,
+
+    fn init(app: *App) !State {
+        const browser = try app.allocator.create(Browser);
+        errdefer app.allocator.destroy(browser);
+
+        browser.* = try Browser.init(app);
+        errdefer browser.deinit();
+
+        var sess = try browser.newSession();
+        _ = try sess.createPage();
+        return .{
+            .browser = browser,
+        };
+    }
+
+    fn deinit(self: *State) void {
+        const allocator = self.browser.app.allocator;
+        self.browser.deinit();
+        allocator.destroy(self.browser);
+    }
+
+    fn page(self: *const State) *@import("browser/Page.zig") {
+        return self.browser.session.?.page.?;
+    }
+
+    fn session(self: *const State) *@import("browser/Session.zig") {
+        return &self.browser.session.?;
     }
 };
 
@@ -845,7 +889,7 @@ fn growBuffer(allocator: Allocator, buf: []u8, required_capacity: usize) ![]u8 {
         if (new_capacity >= required_capacity) break;
     }
 
-    log.debug(.app, "CDP buffer growth", .{ .from = buf.len, .to = new_capacity });
+    log.debug(.app, "WS buffer growth", .{ .from = buf.len, .to = new_capacity });
 
     if (allocator.resize(buf, new_capacity)) {
         return buf.ptr[0..new_capacity];
@@ -1001,445 +1045,3 @@ fn simpleMask(m: []const u8, payload: []u8) void {
         payload[i] = b ^ m[i & 3];
     }
 }
-
-const testing = std.testing;
-test "server: buildJSONVersionResponse" {
-    const address = try net.Address.parseIp4("127.0.0.1", 9001);
-    const res = try buildJSONVersionResponse(testing.allocator, address);
-    defer testing.allocator.free(res);
-
-    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 48\r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
-        "{\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9001/\"}", res);
-}
-
-test "Client: http invalid request" {
-    var c = try createTestClient();
-    defer c.deinit();
-
-    const res = try c.httpRequest("GET /over/9000 HTTP/1.1\r\n" ++ "Header: " ++ ("a" ** 4100) ++ "\r\n\r\n");
-    try testing.expectEqualStrings("HTTP/1.1 413 \r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Length: 17\r\n\r\n" ++
-        "Request too large", res);
-}
-
-test "Client: http invalid handshake" {
-    try assertHTTPError(
-        400,
-        "Invalid request",
-        "\r\n\r\n",
-    );
-
-    try assertHTTPError(
-        404,
-        "Not found",
-        "GET /over/9000 HTTP/1.1\r\n\r\n",
-    );
-
-    try assertHTTPError(
-        404,
-        "Not found",
-        "POST / HTTP/1.1\r\n\r\n",
-    );
-
-    try assertHTTPError(
-        400,
-        "Invalid HTTP protocol",
-        "GET / HTTP/1.0\r\n\r\n",
-    );
-
-    try assertHTTPError(
-        400,
-        "Missing required header",
-        "GET / HTTP/1.1\r\n\r\n",
-    );
-
-    try assertHTTPError(
-        400,
-        "Missing required header",
-        "GET / HTTP/1.1\r\nConnection:  upgrade\r\n\r\n",
-    );
-
-    try assertHTTPError(
-        400,
-        "Missing required header",
-        "GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
-    );
-
-    try assertHTTPError(
-        400,
-        "Missing required header",
-        "GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\n\r\n",
-    );
-}
-
-test "Client: http valid handshake" {
-    var c = try createTestClient();
-    defer c.deinit();
-
-    const request =
-        "GET /   HTTP/1.1\r\n" ++
-        "Connection: upgrade\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "sec-websocket-version:13\r\n" ++
-        "sec-websocket-key: this is my key\r\n" ++
-        "Custom:  Header-Value\r\n\r\n";
-
-    const res = try c.httpRequest(request);
-    try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: upgrade\r\n" ++
-        "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);
-}
-
-test "Client: read invalid websocket message" {
-    // 131 = 128 (fin) | 3  where 3 isn't a valid type
-    try assertWebSocketError(
-        1002,
-        &.{ 131, 128, 'm', 'a', 's', 'k' },
-    );
-
-    for ([_]u8{ 16, 32, 64 }) |rsv| {
-        // none of the reserve flags should be set
-        try assertWebSocketError(
-            1002,
-            &.{ rsv, 128, 'm', 'a', 's', 'k' },
-        );
-
-        // as a bitmask
-        try assertWebSocketError(
-            1002,
-            &.{ rsv + 4, 128, 'm', 'a', 's', 'k' },
-        );
-    }
-
-    // client->server messages must be masked
-    try assertWebSocketError(
-        1002,
-        &.{ 129, 1, 'a' },
-    );
-
-    // control types (ping/ping/close) can't be > 125 bytes
-    for ([_]u8{ 136, 137, 138 }) |op| {
-        try assertWebSocketError(
-            1002,
-            &.{ op, 254, 1, 1 },
-        );
-    }
-
-    // length of message is 0000 0810, i.e: 1024 * 512 + 265
-    try assertWebSocketError(1009, &.{ 129, 255, 0, 0, 0, 0, 0, 8, 1, 0, 'm', 'a', 's', 'k' });
-
-    // continuation type message must come after a normal message
-    // even when not a fin frame
-    try assertWebSocketError(
-        1002,
-        &.{ 0, 129, 'm', 'a', 's', 'k', 'd' },
-    );
-
-    // continuation type message must come after a normal message
-    // even as a fin frame
-    try assertWebSocketError(
-        1002,
-        &.{ 128, 129, 'm', 'a', 's', 'k', 'd' },
-    );
-
-    // text (non-fin) - text (non-fin)
-    try assertWebSocketError(
-        1002,
-        &.{ 1, 129, 'm', 'a', 's', 'k', 'd', 1, 128, 'k', 's', 'a', 'm' },
-    );
-
-    // text (non-fin) - text (fin) should always been continuation after non-fin
-    try assertWebSocketError(
-        1002,
-        &.{ 1, 129, 'm', 'a', 's', 'k', 'd', 129, 128, 'k', 's', 'a', 'm' },
-    );
-
-    // close must be fin
-    try assertWebSocketError(
-        1002,
-        &.{
-            8, 129, 'm', 'a', 's', 'k', 'd',
-        },
-    );
-
-    // ping must be fin
-    try assertWebSocketError(
-        1002,
-        &.{
-            9, 129, 'm', 'a', 's', 'k', 'd',
-        },
-    );
-
-    // pong must be fin
-    try assertWebSocketError(
-        1002,
-        &.{
-            10, 129, 'm', 'a', 's', 'k', 'd',
-        },
-    );
-}
-
-test "Client: ping reply" {
-    try assertWebSocketMessage(
-        // fin | pong, len
-        &.{ 138, 0 },
-
-        // fin | ping, masked | len, 4-byte mask
-        &.{ 137, 128, 0, 0, 0, 0 },
-    );
-
-    try assertWebSocketMessage(
-        // fin | pong, len, payload
-        &.{ 138, 5, 100, 96, 97, 109, 104 },
-
-        // fin | ping, masked | len, 4-byte mask, 5 byte payload
-        &.{ 137, 133, 0, 5, 7, 10, 100, 101, 102, 103, 104 },
-    );
-}
-
-test "Client: close message" {
-    try assertWebSocketMessage(
-        // fin | close, len, close code (normal)
-        &.{ 136, 2, 3, 232 },
-
-        // fin | close, masked | len, 4-byte mask
-        &.{ 136, 128, 0, 0, 0, 0 },
-    );
-}
-
-test "server: mask" {
-    var buf: [4000]u8 = undefined;
-    const messages = [_][]const u8{ "1234", "1234" ** 99, "1234" ** 999 };
-    for (messages) |message| {
-        // we need the message to be mutable since mask operates in-place
-        const payload = buf[0..message.len];
-        @memcpy(payload, message);
-
-        mask(&.{ 1, 2, 200, 240 }, payload);
-        try testing.expectEqual(false, std.mem.eql(u8, payload, message));
-
-        mask(&.{ 1, 2, 200, 240 }, payload);
-        try testing.expectEqual(true, std.mem.eql(u8, payload, message));
-    }
-}
-
-test "server: 404" {
-    var c = try createTestClient();
-    defer c.deinit();
-
-    const res = try c.httpRequest("GET /unknown HTTP/1.1\r\n\r\n");
-    try testing.expectEqualStrings("HTTP/1.1 404 \r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Length: 9\r\n\r\n" ++
-        "Not found", res);
-}
-
-test "server: get /json/version" {
-    const expected_response =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 48\r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
-        "{\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9583/\"}";
-
-    {
-        // twice on the same connection
-        var c = try createTestClient();
-        defer c.deinit();
-
-        const res1 = try c.httpRequest("GET /json/version HTTP/1.1\r\n\r\n");
-        try testing.expectEqualStrings(expected_response, res1);
-    }
-
-    {
-        // again on a new connection
-        var c = try createTestClient();
-        defer c.deinit();
-
-        const res1 = try c.httpRequest("GET /json/version HTTP/1.1\r\n\r\n");
-        try testing.expectEqualStrings(expected_response, res1);
-    }
-}
-
-fn assertHTTPError(
-    comptime expected_status: u16,
-    comptime expected_body: []const u8,
-    input: []const u8,
-) !void {
-    var c = try createTestClient();
-    defer c.deinit();
-
-    const res = try c.httpRequest(input);
-    const expected_response = std.fmt.comptimePrint(
-        "HTTP/1.1 {d} \r\nConnection: Close\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ expected_status, expected_body.len, expected_body },
-    );
-
-    try testing.expectEqualStrings(expected_response, res);
-}
-
-fn assertWebSocketError(close_code: u16, input: []const u8) !void {
-    var c = try createTestClient();
-    defer c.deinit();
-
-    try c.handshake();
-    try c.stream.writeAll(input);
-
-    const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
-    defer if (msg.cleanup_fragment) {
-        c.reader.cleanup();
-    };
-
-    try testing.expectEqual(.close, msg.type);
-    try testing.expectEqual(2, msg.data.len);
-    try testing.expectEqual(close_code, std.mem.readInt(u16, msg.data[0..2], .big));
-}
-
-fn assertWebSocketMessage(expected: []const u8, input: []const u8) !void {
-    var c = try createTestClient();
-    defer c.deinit();
-
-    try c.handshake();
-    try c.stream.writeAll(input);
-
-    const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
-    defer if (msg.cleanup_fragment) {
-        c.reader.cleanup();
-    };
-
-    const actual = c.reader.buf[0 .. msg.data.len + 2];
-    try testing.expectEqualSlices(u8, expected, actual);
-}
-
-const MockCDP = struct {
-    messages: std.ArrayListUnmanaged([]const u8) = .{},
-
-    allocator: Allocator = testing.allocator,
-
-    fn init(_: Allocator, client: anytype) MockCDP {
-        _ = client;
-        return .{};
-    }
-
-    fn deinit(self: *MockCDP) void {
-        const allocator = self.allocator;
-        for (self.messages.items) |msg| {
-            allocator.free(msg);
-        }
-        self.messages.deinit(allocator);
-    }
-
-    fn handleMessage(self: *MockCDP, message: []const u8) bool {
-        const owned = self.allocator.dupe(u8, message) catch unreachable;
-        self.messages.append(self.allocator, owned) catch unreachable;
-        return true;
-    }
-};
-
-fn createTestClient() !TestClient {
-    const address = std.net.Address.initIp4([_]u8{ 127, 0, 0, 1 }, 9583);
-    const stream = try std.net.tcpConnectToAddress(address);
-
-    const timeout = std.mem.toBytes(posix.timeval{
-        .sec = 2,
-        .usec = 0,
-    });
-    try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
-    try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
-    return .{
-        .stream = stream,
-        .reader = .{
-            .allocator = testing.allocator,
-            .buf = try testing.allocator.alloc(u8, 1024 * 16),
-        },
-    };
-}
-
-const TestClient = struct {
-    stream: std.net.Stream,
-    buf: [1024]u8 = undefined,
-    reader: Reader(false),
-
-    fn deinit(self: *TestClient) void {
-        self.stream.close();
-        self.reader.deinit();
-    }
-
-    fn httpRequest(self: *TestClient, req: []const u8) ![]const u8 {
-        try self.stream.writeAll(req);
-
-        var pos: usize = 0;
-        var total_length: ?usize = null;
-        while (true) {
-            pos += try self.stream.read(self.buf[pos..]);
-            if (pos == 0) {
-                return error.NoMoreData;
-            }
-            const response = self.buf[0..pos];
-            if (total_length == null) {
-                const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse continue;
-                const header = response[0 .. header_end + 4];
-
-                const cl = blk: {
-                    const cl_header = "Content-Length: ";
-                    const start = (std.mem.indexOf(u8, header, cl_header) orelse {
-                        break :blk 0;
-                    }) + cl_header.len;
-
-                    const end = std.mem.indexOfScalarPos(u8, header, start, '\r') orelse {
-                        return error.InvalidContentLength;
-                    };
-
-                    break :blk std.fmt.parseInt(usize, header[start..end], 10) catch {
-                        return error.InvalidContentLength;
-                    };
-                };
-
-                total_length = cl + header.len;
-            }
-
-            if (total_length) |tl| {
-                if (pos == tl) {
-                    return response;
-                }
-                if (pos > tl) {
-                    return error.DataExceedsContentLength;
-                }
-            }
-        }
-    }
-
-    fn handshake(self: *TestClient) !void {
-        const request =
-            "GET /   HTTP/1.1\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "sec-websocket-version:13\r\n" ++
-            "sec-websocket-key: this is my key\r\n" ++
-            "Custom:  Header-Value\r\n\r\n";
-
-        const res = try self.httpRequest(request);
-        try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: upgrade\r\n" ++
-            "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);
-    }
-
-    fn readWebsocketMessage(self: *TestClient) !?Message {
-        while (true) {
-            const n = try self.stream.read(self.reader.readBuf());
-            if (n == 0) {
-                return error.Closed;
-            }
-            self.reader.len += n;
-            if (try self.reader.next()) |msg| {
-                return msg;
-            }
-        }
-    }
-};

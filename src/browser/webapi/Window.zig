@@ -49,6 +49,7 @@ _proto: *EventTarget,
 _document: *Document,
 _css: CSS = .init,
 _crypto: Crypto = .init,
+_lightpanda: Lightpanda = .{},
 _console: Console = .init,
 _navigator: Navigator = .init,
 _screen: *Screen,
@@ -107,6 +108,10 @@ pub fn getScreen(self: *Window) *Screen {
 
 pub fn getCrypto(self: *Window) *Crypto {
     return &self._crypto;
+}
+
+pub fn getLightpanda(self: *Window) *Lightpanda {
+    return &self._lightpanda;
 }
 
 pub fn getCSS(self: *Window) *CSS {
@@ -641,6 +646,7 @@ pub const JsApi = struct {
     pub const history = bridge.accessor(Window.getHistory, null, .{});
     pub const navigation = bridge.accessor(Window.getNavigation, null, .{});
     pub const crypto = bridge.accessor(Window.getCrypto, null, .{ .cache = "crypto" });
+    pub const lightpanda = bridge.accessor(Window.getLightpanda, null, .{ .cache = "lightpanda" });
     pub const CSS = bridge.accessor(Window.getCSS, null, .{ .cache = "CSS" });
     pub const customElements = bridge.accessor(Window.getCustomElements, null, .{ .cache = "customElements" });
     pub const onload = bridge.accessor(Window.getOnLoad, Window.setOnLoad, .{});
@@ -677,6 +683,32 @@ pub const JsApi = struct {
     pub const pageYOffset = bridge.accessor(Window.getScrollY, null, .{ .cache = "pageYOffset" });
     pub const scrollTo = bridge.function(Window.scrollTo, .{});
     pub const scroll = bridge.function(Window.scrollTo, .{});
+};
+
+pub const Lightpanda = struct {
+    _pad: bool = false,
+
+    pub fn send(_: *const Lightpanda, data: js.Value, page: *Page) !void {
+        return page.sendToOperator(try data.toJson(page.call_arena));
+    }
+
+    pub fn navigate(_: *const Lightpanda, url: [:0]const u8, page: *Page) !void {
+        return page.navigate(url, .{});
+    }
+
+    pub const JsApi = struct {
+        pub const bridge = js.Bridge(Lightpanda);
+
+        pub const Meta = struct {
+            pub const name = "Lightpanda";
+            pub const prototype_chain = bridge.prototypeChain();
+            pub var class_id: bridge.ClassId = undefined;
+            pub const empty_with_no_proto = true;
+        };
+
+        pub const send = bridge.function(Lightpanda.send, .{});
+        pub const navigate = bridge.function(Lightpanda.navigate, .{});
+    };
 };
 
 const testing = @import("../../testing.zig");

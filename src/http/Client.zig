@@ -102,24 +102,10 @@ use_proxy: bool,
 // The complete user-agent header line
 user_agent: [:0]const u8,
 
-cdp_client: ?CDPClient = null,
+operator: ?Operator = null,
 
-// libcurl can monitor arbitrary sockets, this lets us use libcurl to poll
-// both HTTP data as well as messages from an CDP connection.
-// Furthermore, we have some tension between blocking scripts and request
-// interception. For non-blocking scripts, because nothing blocks, we can
-// just queue the scripts until we receive a response to the interception
-// notification. But for blocking scripts (which block the parser), it's hard
-// to return control back to the CDP loop. So the `read` function pointer is
-// used by the Client to have the CDP client read more data from the socket,
-// specifically when we're waiting for a request interception response to
-// a blocking script.
-pub const CDPClient = struct {
+pub const Operator = struct {
     socket: posix.socket_t,
-    ctx: *anyopaque,
-    blocking_read_start: *const fn (*anyopaque) bool,
-    blocking_read: *const fn (*anyopaque) bool,
-    blocking_read_end: *const fn (*anyopaque) bool,
 };
 
 const TransferQueue = std.DoublyLinkedList;
@@ -218,74 +204,8 @@ pub fn request(self: *Client, req: Request) !void {
     const transfer = try self.makeTransfer(req);
 
     const notification = self.notification orelse return self.process(transfer);
-
     notification.dispatch(.http_request_start, &.{ .transfer = transfer });
-
-    var wait_for_interception = false;
-    notification.dispatch(.http_request_intercept, &.{ .transfer = transfer, .wait_for_interception = &wait_for_interception });
-    if (wait_for_interception == false) {
-        // request not intercepted, process it normally
-        return self.process(transfer);
-    }
-
-    self.intercepted += 1;
-    if (comptime IS_DEBUG) {
-        log.debug(.http, "wait for interception", .{ .intercepted = self.intercepted });
-    }
-    transfer._intercept_state = .pending;
-
-    if (req.blocking == false) {
-        // The request was interecepted, but it isn't a blocking request, so we
-        // dont' need to block this call. The request will be unblocked
-        // asynchronously via eitehr continueTransfer or abortTransfer
-        return;
-    }
-
-    if (try self.waitForInterceptedResponse(transfer)) {
-        return self.process(transfer);
-    }
-}
-
-fn waitForInterceptedResponse(self: *Client, transfer: *Transfer) !bool {
-    // The request was intercepted and is blocking. This is messy, but our
-    // callers, the ScriptManager -> Page, don't have a great way to stop the
-    // parser and return control to the CDP server to wait for the interception
-    // response. We have some information on the CDPClient, so we'll do the
-    // blocking here. (This is a bit of a legacy thing. Initially the Client
-    // had a 'extra_socket' that it could monitor. It was named 'extra_socket'
-    // to appear generic, but really, that 'extra_socket' was always the CDP
-    // socket. Because we already had the "extra_socket" here, it was easier to
-    // make it even more CDP- aware and turn `extra_socket: socket_t` into the
-    // current CDPClient and do the blocking here).
-    const cdp_client = self.cdp_client.?;
-    const ctx = cdp_client.ctx;
-
-    if (cdp_client.blocking_read_start(ctx) == false) {
-        return error.BlockingInterceptFailure;
-    }
-
-    defer _ = cdp_client.blocking_read_end(ctx);
-
-    while (true) {
-        if (cdp_client.blocking_read(ctx) == false) {
-            return error.BlockingInterceptFailure;
-        }
-
-        switch (transfer._intercept_state) {
-            .pending => continue, // keep waiting
-            .@"continue" => return true,
-            .abort => |err| {
-                transfer.abort(err);
-                return false;
-            },
-            .fulfilled => {
-                // callbacks already called, just need to cleanups
-                transfer.deinit();
-                return false;
-            },
-            .not_intercepted => unreachable,
-        }
-    }
+    return self.process(transfer);
 }
 
 // Above, request will not process if there's an interception request. In such
@@ -295,51 +215,7 @@ fn process(self: *Client, transfer: *Transfer) !void {
     if (self.handles.getFreeHandle()) |handle| {
         return self.makeRequest(handle, transfer);
     }
-
     self.queue.append(&transfer._node);
-}
-
-// For an intercepted request
-pub fn continueTransfer(self: *Client, transfer: *Transfer) !void {
-    if (comptime IS_DEBUG) {
-        std.debug.assert(transfer._intercept_state != .not_intercepted);
-        log.debug(.http, "continue transfer", .{ .intercepted = self.intercepted });
-    }
-    self.intercepted -= 1;
-
-    if (!transfer.req.blocking) {
-        return self.process(transfer);
-    }
-    transfer._intercept_state = .@"continue";
-}
-
-// For an intercepted request
-pub fn abortTransfer(self: *Client, transfer: *Transfer) void {
-    if (comptime IS_DEBUG) {
-        std.debug.assert(transfer._intercept_state != .not_intercepted);
-        log.debug(.http, "abort transfer", .{ .intercepted = self.intercepted });
-    }
-    self.intercepted -= 1;
-
-    if (!transfer.req.blocking) {
-        transfer.abort(error.Abort);
-    }
-    transfer._intercept_state = .{ .abort = error.Abort };
-}
-
-// For an intercepted request
-pub fn fulfillTransfer(self: *Client, transfer: *Transfer, status: u16, headers: []const Http.Header, body: ?[]const u8) !void {
-    if (comptime IS_DEBUG) {
-        std.debug.assert(transfer._intercept_state != .not_intercepted);
-        log.debug(.http, "filfull transfer", .{ .intercepted = self.intercepted });
-    }
-    self.intercepted -= 1;
-
-    try transfer.fulfill(status, headers, body);
-    if (!transfer.req.blocking) {
-        transfer.deinit();
-    }
-    transfer._intercept_state = .fulfilled;
 }
 
 pub fn nextReqId(self: *Client) usize {
@@ -510,7 +386,7 @@ fn makeRequest(self: *Client, handle: *Handle, transfer: *Transfer) !void {
 }
 
 pub const PerformStatus = enum {
-    cdp_socket,
+    operator_socket,
     normal,
 };
 
@@ -526,16 +402,16 @@ fn perform(self: *Client, timeout_ms: c_int) !PerformStatus {
     }
 
     var status = PerformStatus.normal;
-    if (self.cdp_client) |cdp_client| {
+    if (self.operator) |operator| {
         var wait_fd = c.curl_waitfd{
-            .fd = cdp_client.socket,
+            .fd = operator.socket,
             .events = c.CURL_WAIT_POLLIN,
             .revents = 0,
         };
         try errorMCheck(c.curl_multi_poll(multi, &wait_fd, 1, timeout_ms, null));
         if (wait_fd.revents != 0) {
             // the extra socket we passed in is ready, let's signal our caller
-            status = .cdp_socket;
+            status = .operator_socket;
         }
     } else if (running > 0) {
         try errorMCheck(c.curl_multi_poll(multi, null, 0, timeout_ms, null));
@@ -556,32 +432,6 @@ fn processMessages(self: *Client) !bool {
 
         const easy = msg.easy_handle.?;
         const transfer = try Transfer.fromEasy(easy);
-
-        // In case of auth challenge
-        // TODO give a way to configure the number of auth retries.
-        if (transfer._auth_challenge != null and transfer._tries < 10) {
-            if (transfer.client.notification) |notification| {
-                var wait_for_interception = false;
-                notification.dispatch(.http_request_auth_required, &.{ .transfer = transfer, .wait_for_interception = &wait_for_interception });
-                if (wait_for_interception) {
-                    self.intercepted += 1;
-                    if (comptime IS_DEBUG) {
-                        log.debug(.http, "wait for auth interception", .{ .intercepted = self.intercepted });
-                    }
-                    transfer._intercept_state = .pending;
-                    if (!transfer.req.blocking) {
-                        // the request is put on hold to be intercepted.
-                        // In this case we ignore callbacks for now.
-                        // Note: we don't deinit transfer on purpose: we want to keep
-                        // using it for the following request
-                        self.endTransfer(transfer);
-                        continue;
-                    }
-
-                    _ = try self.waitForInterceptedResponse(transfer);
-                }
-            }
-        }
 
         // release it ASAP so that it's available; some done_callbacks
         // will load more resources.
@@ -754,13 +604,6 @@ pub const Request = struct {
     cookie_jar: *CookieJar,
     resource_type: ResourceType,
     credentials: ?[:0]const u8 = null,
-
-    // This is only relevant for intercepted requests. If a request is flagged
-    // as blocking AND is intercepted, then it'll be up to us to wait until
-    // we receive a response to the interception. This probably isn't ideal,
-    // but it's harder for our caller (ScriptManager) to deal with this. One
-    // reason for that is the Http Client is already a bit CDP-aware.
-    blocking: bool = false,
 
     // arbitrary data that can be associated with this request
     ctx: *anyopaque = undefined,
@@ -975,22 +818,6 @@ pub const Transfer = struct {
             self.client.endTransfer(self);
         }
         self.deinit();
-    }
-
-    // abortAuthChallenge is called when an auth challenge interception is
-    // abort. We don't call self.client.endTransfer here b/c it has been done
-    // before interception process.
-    pub fn abortAuthChallenge(self: *Transfer) void {
-        if (comptime IS_DEBUG) {
-            std.debug.assert(self._intercept_state != .not_intercepted);
-            log.debug(.http, "abort auth transfer", .{ .intercepted = self.client.intercepted });
-        }
-        self.client.intercepted -= 1;
-        if (!self.req.blocking) {
-            self.abort(error.AbortAuthChallenge);
-            return;
-        }
-        self._intercept_state = .{ .abort = error.AbortAuthChallenge };
     }
 
     // redirectionCookies manages cookies during redirections handled by Curl.
@@ -1234,50 +1061,6 @@ pub const Transfer = struct {
         var private: *anyopaque = undefined;
         try errorCheck(c.curl_easy_getinfo(easy, c.CURLINFO_PRIVATE, &private));
         return @ptrCast(@alignCast(private));
-    }
-
-    pub fn fulfill(transfer: *Transfer, status: u16, headers: []const Http.Header, body: ?[]const u8) !void {
-        if (transfer._handle != null) {
-            // should never happen, should have been intercepted/paused, and then
-            // either continued, aborted or fulfilled once.
-            @branchHint(.unlikely);
-            return error.RequestInProgress;
-        }
-
-        transfer._fulfill(status, headers, body) catch |err| {
-            transfer.req.error_callback(transfer.req.ctx, err);
-            return err;
-        };
-    }
-
-    fn _fulfill(transfer: *Transfer, status: u16, headers: []const Http.Header, body: ?[]const u8) !void {
-        const req = &transfer.req;
-        if (req.start_callback) |cb| {
-            try cb(transfer);
-        }
-
-        transfer.response_header = .{
-            .status = status,
-            .url = req.url,
-            .redirect_count = 0,
-            ._injected_headers = headers,
-        };
-        for (headers) |hdr| {
-            if (std.ascii.eqlIgnoreCase(hdr.name, "content-type")) {
-                const len = @min(hdr.value.len, ResponseHeader.MAX_CONTENT_TYPE_LEN);
-                @memcpy(transfer.response_header.?._content_type[0..len], hdr.value[0..len]);
-                transfer.response_header.?._content_type_len = len;
-                break;
-            }
-        }
-
-        try req.header_callback(transfer);
-
-        if (body) |b| {
-            try req.data_callback(transfer, b);
-        }
-
-        try req.done_callback(req.ctx);
     }
 
     // This function should be called during the dataCallback. Calling it after

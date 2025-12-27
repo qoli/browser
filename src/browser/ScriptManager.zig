@@ -256,7 +256,6 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
             .ctx = script,
             .method = .GET,
             .headers = headers,
-            .blocking = is_blocking,
             .cookie_jar = &page._session.cookie_jar,
             .resource_type = .script,
             .start_callback = if (log.enabled(.http, .debug)) Script.startCallback else null,

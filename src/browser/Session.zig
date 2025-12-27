@@ -136,7 +136,7 @@ pub fn currentPage(self: *Session) ?*Page {
 pub const WaitResult = enum {
     done,
     no_page,
-    cdp_socket,
+    operator_socket,
     navigate,
 };
 
@@ -148,7 +148,6 @@ pub fn wait(self: *Session, wait_ms: u32) WaitResult {
             else => |result| return result,
         }
         // if we've successfull navigated, we'll give the new page another
-        // page.wait(wait_ms)
     }
 }
 

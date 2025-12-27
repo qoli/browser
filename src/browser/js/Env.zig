@@ -26,7 +26,6 @@ const bridge = @import("bridge.zig");
 const Context = @import("Context.zig");
 const Platform = @import("Platform.zig");
 const Snapshot = @import("Snapshot.zig");
-const Inspector = @import("Inspector.zig");
 const ExecutionWorld = @import("ExecutionWorld.zig");
 
 const JsApis = bridge.JsApis;
@@ -117,10 +116,6 @@ pub fn deinit(self: *Env) void {
     v8.destroyArrayBufferAllocator(self.isolate_params.array_buffer_allocator.?);
     self.allocator.destroy(self.isolate_params);
     self.allocator.free(self.templates);
-}
-
-pub fn newInspector(self: *Env, arena: Allocator, ctx: anytype) !Inspector {
-    return Inspector.init(arena, self.isolate, ctx);
 }
 
 pub fn runMicrotasks(self: *const Env) void {

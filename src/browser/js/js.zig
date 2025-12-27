@@ -25,7 +25,6 @@ pub const Env = @import("Env.zig");
 pub const bridge = @import("bridge.zig");
 pub const ExecutionWorld = @import("ExecutionWorld.zig");
 pub const Context = @import("Context.zig");
-pub const Inspector = @import("Inspector.zig");
 pub const Snapshot = @import("Snapshot.zig");
 pub const Platform = @import("Platform.zig");
 
@@ -462,13 +461,6 @@ pub const TaggedAnyOpaque = struct {
     // we have the comptime parameter info for all functions), and the index field
     // we can figure out what type this is.
     value: *anyopaque,
-
-    // When we're asked to describe an object via the Inspector, we _must_ include
-    // the proper subtype (and description) fields in the returned JSON.
-    // V8 will give us a Value and ask us for the subtype. From the v8.Value we
-    // can get a v8.Object, and from the v8.Object, we can get out TaggedAnyOpaque
-    // which is where we store the subtype.
-    subtype: ?bridge.SubType,
 };
 
 pub const PrototypeChainEntry = struct {
@@ -476,38 +468,22 @@ pub const PrototypeChainEntry = struct {
     offset: u16, // offset to the _proto field
 };
 
-// These are here, and not in Inspector.zig, because Inspector.zig isn't always
-// included (e.g. in the wpt build).
-
-// This is called from V8. Whenever the v8 inspector has to describe a value
-// it'll call this function to gets its [optional] subtype - which, from V8's
-// point of view, is an arbitrary string.
-pub export fn v8_inspector__Client__IMPL__valueSubtype(
-    _: *v8.c.InspectorClientImpl,
-    c_value: *const v8.C_Value,
-) callconv(.c) [*c]const u8 {
-    const external_entry = Inspector.getTaggedAnyOpaque(.{ .handle = c_value }) orelse return null;
-    return if (external_entry.subtype) |st| @tagName(st) else null;
-}
-
-// Same as valueSubType above, but for the optional description field.
-// From what I can tell, some drivers _need_ the description field to be
-// present, even if it's empty. So if we have a subType for the value, we'll
-// put an empty description.
-pub export fn v8_inspector__Client__IMPL__descriptionForValueSubtype(
-    _: *v8.c.InspectorClientImpl,
-    v8_context: *const v8.C_Context,
-    c_value: *const v8.C_Value,
-) callconv(.c) [*c]const u8 {
-    _ = v8_context;
-
-    // We _must_ include a non-null description in order for the subtype value
-    // to be included. Besides that, I don't know if the value has any meaning
-    const external_entry = Inspector.getTaggedAnyOpaque(.{ .handle = c_value }) orelse return null;
-    return if (external_entry.subtype == null) null else "";
-}
-
 test "TaggedAnyOpaque" {
     // If we grow this, fine, but it should be a conscious decision
     try std.testing.expectEqual(24, @sizeOf(TaggedAnyOpaque));
+}
+
+pub export fn v8_inspector__Client__IMPL__valueSubtype(
+    _: *v8.c.InspectorClientImpl,
+    _: *const v8.C_Value,
+) callconv(.c) [*c]const u8 {
+    return null;
+}
+
+pub export fn v8_inspector__Client__IMPL__descriptionForValueSubtype(
+    _: *v8.c.InspectorClientImpl,
+    _: *const v8.C_Context,
+    _: *const v8.C_Value,
+) callconv(.c) [*c]const u8 {
+    return null;
 }

@@ -69,7 +69,7 @@ pub fn deinit(self: *ExecutionWorld) void {
 // when the handle_scope is freed.
 // We also maintain our own "context_arena" which allows us to have
 // all page related memory easily managed.
-pub fn createContext(self: *ExecutionWorld, page: *Page, enter: bool) !*Context {
+pub fn createContext(self: *ExecutionWorld, page: *Page) !*Context {
     std.debug.assert(self.context == null);
 
     const env = self.env;
@@ -102,15 +102,14 @@ pub fn createContext(self: *ExecutionWorld, page: *Page, enter: bool) !*Context 
     // The main Context that enters and holds the HandleScope should therefore always be created first. Following other worlds for this page
     // like isolated Worlds, will thereby place their objects on the main page's HandleScope. Note: In the furure the number of context will multiply multiple frames support
     var handle_scope: ?v8.HandleScope = null;
-    if (enter) {
-        handle_scope = @as(v8.HandleScope, undefined);
-        v8.HandleScope.init(&handle_scope.?, isolate);
-        v8_context.enter();
-    }
-    errdefer if (enter) {
+    handle_scope = @as(v8.HandleScope, undefined);
+    v8.HandleScope.init(&handle_scope.?, isolate);
+    v8_context.enter();
+
+    errdefer {
         v8_context.exit();
         handle_scope.?.deinit();
-    };
+    }
 
     const context_id = env.context_id;
     env.context_id = context_id + 1;
@@ -147,14 +146,6 @@ pub fn removeContext(self: *ExecutionWorld) void {
     self.context.?.deinit();
     self.context = null;
     _ = self.context_arena.reset(.{ .retain_with_limit = CONTEXT_ARENA_RETAIN });
-}
-
-pub fn terminateExecution(self: *const ExecutionWorld) void {
-    self.env.isolate.terminateExecution();
-}
-
-pub fn resumeExecution(self: *const ExecutionWorld) void {
-    self.env.isolate.cancelTerminateExecution();
 }
 
 pub fn unknownPropertyCallback(c_name: ?*const v8.C_Name, raw_info: ?*const v8.C_PropertyCallbackInfo) callconv(.c) u8 {

@@ -89,13 +89,13 @@ pub fn poll(self: *Http, timeout_ms: u32) Client.PerformStatus {
     };
 }
 
-pub fn addCDPClient(self: *Http, cdp_client: Client.CDPClient) void {
-    std.debug.assert(self.client.cdp_client == null);
-    self.client.cdp_client = cdp_client;
+pub fn addOperator(self: *Http, operator: Client.Operator) void {
+    std.debug.assert(self.client.operator == null);
+    self.client.operator = operator;
 }
 
-pub fn removeCDPClient(self: *Http) void {
-    self.client.cdp_client = null;
+pub fn removeOperator(self: *Http) void {
+    self.client.operator = null;
 }
 
 pub fn newConnection(self: *Http) !Connection {

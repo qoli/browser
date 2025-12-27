@@ -648,7 +648,6 @@ pub fn mapZigInstanceToJs(self: *Context, js_obj_: ?v8.Object, value: anytype) !
                     .value = resolved.ptr,
                     .prototype_chain = resolved.prototype_chain.ptr,
                     .prototype_len = @intCast(resolved.prototype_chain.len),
-                    .subtype = if (@hasDecl(JsApi.Meta, "subtype")) JsApi.Meta.subype else .node,
                 };
 
                 // Skip setting internal field for the global object (Window)

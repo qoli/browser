@@ -107,7 +107,7 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
             };
 
             // _server is global to handle graceful shutdown.
-            _server = try lp.Server.init(app, address);
+            _server = try lp.Server.init(app);
             const server = &_server.?;
             defer server.deinit();
 

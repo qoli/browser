@@ -617,4 +617,5 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/navigation/NavigationEventTarget.zig"),
     @import("../webapi/navigation/NavigationHistoryEntry.zig"),
     @import("../webapi/navigation/NavigationActivation.zig"),
+    @import("../webapi/Window.zig").Lightpanda,
 });
