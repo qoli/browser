@@ -402,7 +402,7 @@ const Client = struct {
         self.mode = .{ .websocket = try State.init(self.server.app) };
         errdefer self.mode.websocket.deinit();
 
-        self.mode.websocket.page()._operator = .{
+        (try self.mode.websocket.page())._operator = .{
             .ctx = self,
             .send = sendFromCtx,
         };
@@ -468,9 +468,8 @@ const Client = struct {
                     }
                     log.info(.cdp, "input", .{ .cmd = cmd.string });
 
-                    const page = state.page();
-                    const js = page.js;
                     if (std.mem.eql(u8, cmd.string, "navigate")) {
+                        state.session().removePage();
                         const url = obj.get("url") orelse {
                             try self.sendJSON(.{ .err = "missing 'url' field" }, .{});
                             break :blk;
@@ -480,11 +479,18 @@ const Client = struct {
                             break :blk;
                         }
 
+                        const page = try state.page();
+                        page._operator = .{
+                            .ctx = self,
+                            .send = sendFromCtx,
+                        };
                         try page.navigate(try send_allocator.dupeZ(u8, url.string), .{});
                         break :blk;
                     }
 
                     if (std.mem.eql(u8, cmd.string, "eval")) {
+                        const page = try state.page();
+                        const js = page.js;
                         const script = obj.get("script") orelse {
                             try self.sendJSON(.{ .err = "missing 'script' field" }, .{});
                             break :blk;
@@ -606,8 +612,7 @@ const State = struct {
         browser.* = try Browser.init(app);
         errdefer browser.deinit();
 
-        var sess = try browser.newSession();
-        _ = try sess.createPage();
+        _ = try browser.newSession();
         return .{
             .browser = browser,
         };
@@ -619,8 +624,9 @@ const State = struct {
         allocator.destroy(self.browser);
     }
 
-    fn page(self: *const State) *@import("browser/Page.zig") {
-        return self.browser.session.?.page.?;
+    fn page(self: *const State) !*@import("browser/Page.zig") {
+        const s = self.session();
+        return s.page orelse try s.createPage();
     }
 
     fn session(self: *const State) *@import("browser/Session.zig") {
