@@ -1252,4 +1252,5 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/navigation/NavigationActivation.zig"),
     @import("../webapi/canvas/CanvasRenderingContext2D.zig"),
     @import("../webapi/canvas/WebGLRenderingContext.zig"),
+    @import("../webapi/Selection.zig"),
 });
