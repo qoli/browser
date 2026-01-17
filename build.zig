@@ -23,12 +23,14 @@ const Build = std.Build;
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const is_tvos = target.result.os.tag == .tvos;
 
     const manifest = Manifest.init(b);
 
     const git_commit = b.option([]const u8, "git_commit", "Current git commit");
     const prebuilt_v8_path = b.option([]const u8, "prebuilt_v8_path", "Path to prebuilt libc_v8.a");
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
+    const force_static = b.option(bool, "static", "Build fully static executables") orelse false;
 
     var opts = b.addOptions();
     opts.addOption([]const u8, "version", manifest.version);
@@ -59,6 +61,7 @@ pub fn build(b: *Build) !void {
         const exe = b.addExecutable(.{
             .name = "lightpanda",
             .use_llvm = true,
+            .linkage = if (force_static) .static else null,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = target,
@@ -80,11 +83,12 @@ pub fn build(b: *Build) !void {
         run_step.dependOn(&run_cmd.step);
     }
 
-    {
+    if (!is_tvos) {
         // snapshot creator
         const exe = b.addExecutable(.{
             .name = "lightpanda-snapshot-creator",
             .use_llvm = true,
+            .linkage = if (force_static) .static else null,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main_snapshot_creator.zig"),
                 .target = target,
@@ -104,23 +108,27 @@ pub fn build(b: *Build) !void {
         run_step.dependOn(&run_cmd.step);
     }
 
-    {
+    if (!is_tvos) {
         // test
         const tests = b.addTest(.{
             .root_module = lightpanda_module,
             .use_llvm = true,
             .test_runner = .{ .path = b.path("src/test_runner.zig"), .mode = .simple },
         });
+        if (force_static) {
+            tests.linkage = .static;
+        }
         const run_tests = b.addRunArtifact(tests);
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_tests.step);
     }
 
-    {
+    if (!is_tvos) {
         // browser
         const exe = b.addExecutable(.{
             .name = "legacy_test",
             .use_llvm = true,
+            .linkage = if (force_static) .static else null,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main_legacy_test.zig"),
                 .target = target,
@@ -142,11 +150,12 @@ pub fn build(b: *Build) !void {
         run_step.dependOn(&run_cmd.step);
     }
 
-    {
+    if (!is_tvos) {
         // wpt
         const exe = b.addExecutable(.{
             .name = "lightpanda-wpt",
             .use_llvm = true,
+            .linkage = if (force_static) .static else null,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main_wpt.zig"),
                 .target = target,
@@ -181,40 +190,107 @@ fn addDependencies(b: *Build, mod: *Build.Module, opts: *Build.Step.Options, pre
     };
 
     mod.addIncludePath(b.path("vendor/lightpanda"));
+    if (target.result.os.tag == .ios or target.result.os.tag == .tvos) {
+        if (b.sysroot) |sysroot| {
+            const include_path = b.fmt("{s}/usr/include", .{sysroot});
+            mod.addSystemIncludePath(.{ .cwd_relative = include_path });
+        } else {
+            const sdkroot = std.process.getEnvVarOwned(b.allocator, "SDKROOT") catch null;
+            if (sdkroot) |root| {
+                defer b.allocator.free(root);
+                const include_path = b.fmt("{s}/usr/include", .{root});
+                mod.addSystemIncludePath(.{ .cwd_relative = include_path });
+            }
+        }
+    }
 
     {
         // html5ever
 
         // Build step to install html5ever dependency.
+        const cargo_target = switch (target.result.os.tag) {
+            .ios => switch (target.result.cpu.arch) {
+                .aarch64 => "aarch64-apple-ios",
+                .x86_64 => "x86_64-apple-ios",
+                else => null,
+            },
+            .tvos => switch (target.result.cpu.arch) {
+                .aarch64 => "aarch64-apple-tvos",
+                .x86_64 => "x86_64-apple-tvos",
+                else => null,
+            },
+            else => null,
+        };
+        const needs_build_std = target.result.os.tag == .tvos;
+
         const html5ever_argv = blk: {
-            const argv: []const []const u8 = &.{
-                "cargo",
-                "build",
+            var args = std.ArrayList([]const u8).empty;
+
+            if (needs_build_std) {
+                try args.appendSlice(b.allocator, &.{
+                    "rustup",
+                    "run",
+                    "nightly",
+                    "cargo",
+                    "build",
+                });
+            } else {
+                try args.appendSlice(b.allocator, &.{
+                    "cargo",
+                    "build",
+                });
+            }
+
+            try args.appendSlice(b.allocator, &.{
                 // Seems cargo can figure out required paths out of Cargo.toml.
                 "--manifest-path",
                 "src/html5ever/Cargo.toml",
                 // TODO: We can prefer `--artifact-dir` once it become stable.
                 "--target-dir",
                 b.getInstallPath(.prefix, "html5ever"),
-                // This must be the last argument.
-                "--release",
-            };
+            });
 
-            break :blk switch (mod.optimize.?) {
-                // Prefer dev build on debug option.
-                .Debug => argv[0 .. argv.len - 1],
-                else => argv,
-            };
+            if (cargo_target) |ct| {
+                try args.appendSlice(b.allocator, &.{ "--target", ct });
+            }
+
+            if (needs_build_std) {
+                try args.appendSlice(b.allocator, &.{
+                    "-Z",
+                    "build-std=std,panic_abort",
+                });
+            }
+
+            if (mod.optimize.? != .Debug) {
+                try args.append(b.allocator, "--release");
+            }
+
+            break :blk try args.toOwnedSlice(b.allocator);
         };
         const html5ever_exec_cargo = b.addSystemCommand(html5ever_argv);
+        if (needs_build_std) {
+            html5ever_exec_cargo.setEnvironmentVariable("RUSTFLAGS", "-Cpanic=abort");
+            const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch null;
+            if (home) |home_path| {
+                defer b.allocator.free(home_path);
+                const rustc_path = b.fmt("{s}/.rustup/toolchains/nightly-aarch64-apple-darwin/bin/rustc", .{home_path});
+                html5ever_exec_cargo.setEnvironmentVariable("RUSTC", rustc_path);
+            }
+        }
         const html5ever_step = b.step("html5ever", "Install html5ever dependency (requires cargo)");
         html5ever_step.dependOn(&html5ever_exec_cargo.step);
         opts.step.dependOn(html5ever_step);
 
         const html5ever_obj = switch (mod.optimize.?) {
-            .Debug => b.getInstallPath(.prefix, "html5ever/debug/liblitefetch_html5ever.a"),
+            .Debug => if (cargo_target) |ct|
+                b.getInstallPath(.prefix, b.fmt("html5ever/{s}/debug/liblitefetch_html5ever.a", .{ct}))
+            else
+                b.getInstallPath(.prefix, "html5ever/debug/liblitefetch_html5ever.a"),
             // Release builds.
-            else => b.getInstallPath(.prefix, "html5ever/release/liblitefetch_html5ever.a"),
+            else => if (cargo_target) |ct|
+                b.getInstallPath(.prefix, b.fmt("html5ever/{s}/release/liblitefetch_html5ever.a", .{ct}))
+            else
+                b.getInstallPath(.prefix, "html5ever/release/liblitefetch_html5ever.a"),
         };
 
         mod.addObjectFile(.{ .cwd_relative = html5ever_obj });

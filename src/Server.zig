@@ -95,8 +95,11 @@ pub fn run(self: *Server, address: net.Address, timeout_ms: u32) !void {
     self.listener = listener;
 
     try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    if (@hasDecl(posix.TCP, "NODELAY")) {
-        try posix.setsockopt(listener, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
+    switch (@typeInfo(posix.TCP)) {
+        .@"struct" => if (@hasDecl(posix.TCP, "NODELAY")) {
+            try posix.setsockopt(listener, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
+        },
+        else => {},
     }
 
     try posix.bind(listener, &address.any, address.getOsSockLen());

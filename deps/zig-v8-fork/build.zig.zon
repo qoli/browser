@@ -1,0 +1,12 @@
+.{
+    .name = .v8,
+    .paths = .{""},
+    .version = "0.0.0",
+    .fingerprint = 0x10be7411eb47d7c5,
+    .dependencies = .{
+        .depot_tools = .{
+            .url = "git+https://github.com/rust-skia/depot_tools#8efa575d754b8703d99b0f827528e45aeaa167aa",
+            .hash = "N-V-__8AANgeXQAuTDjDItrtITfVslPonFWB-h3Az2C0-2AM",
+        },
+    },
+}
