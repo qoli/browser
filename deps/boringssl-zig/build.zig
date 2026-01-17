@@ -46,13 +46,22 @@ pub fn build(b: *std.Build) void {
     libcrypto.linkLibCpp();
     libcrypto.linkLibrary(libfipsmodule);
     libcrypto.addIncludePath(ssl_source.path("include"));
+    const is_tvos_sim = target.result.os.tag == .tvos and target.result.abi == .simulator;
+    const crypto_files = if (is_tvos_sim)
+        filterSources(b, crypto_sources, &.{"crypto/hrss/hrss.cc"})
+    else
+        crypto_sources;
+    const generated_crypto_files = if (is_tvos_sim)
+        filterSources(b, generated_crypto_sources, &.{"crypto/hrss/asm/poly_rq_mul.S"})
+    else
+        generated_crypto_sources;
     libcrypto.addCSourceFiles(.{
         .root = ssl_source.path("."),
-        .files = crypto_sources,
+        .files = crypto_files,
     });
     libcrypto.addCSourceFiles(.{
         .root = ssl_source.path("."),
-        .files = generated_crypto_sources,
+        .files = generated_crypto_files,
     });
     b.installArtifact(libcrypto);
 
@@ -165,6 +174,27 @@ fn appleSysrootIncludePath(b: *std.Build) ?[]const u8 {
     return null;
 }
 
+fn filterSources(
+    b: *std.Build,
+    sources: []const []const u8,
+    skip: []const []const u8,
+) []const []const u8 {
+    var list = std.ArrayList([]const u8).empty;
+    for (sources) |src| {
+        var should_skip = false;
+        for (skip) |entry| {
+            if (std.mem.eql(u8, src, entry)) {
+                should_skip = true;
+                break;
+            }
+        }
+        if (!should_skip) {
+            list.append(b.allocator, src) catch @panic("OOM");
+        }
+    }
+    return list.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
 const pki_sources = &.{
     "pki/cert_error_id.cc",
     "pki/cert_error_params.cc",
@@ -263,7 +293,7 @@ const ssl_sources = &.{
     "ssl/tls_record.cc",
 };
 
-const crypto_sources = &.{
+const crypto_sources: []const []const u8 = &.{
     "crypto/aes/aes.cc",
     "crypto/asn1/a_bitstr.cc",
     "crypto/asn1/a_bool.cc",
@@ -639,7 +669,7 @@ const generated_fipsmodule_sources = &.{
     "third_party/fiat/asm/fiat_p256_adx_sqr.S",
 };
 
-const generated_crypto_sources = &.{
+const generated_crypto_sources: []const []const u8 = &.{
     "crypto/curve25519/asm/x25519-asm-arm.S",
     "crypto/hrss/asm/poly_rq_mul.S",
     "crypto/poly1305/poly1305_arm_asm.S",

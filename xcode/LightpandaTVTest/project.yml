@@ -1,0 +1,45 @@
+name: LightpandaTVTest
+options:
+  bundleIdPrefix: io.lightpanda
+  deploymentTarget:
+    tvOS: "17.0"
+
+settings:
+  base:
+    INFOPLIST_FILE: Info.plist
+
+targets:
+  LightpandaTVTest:
+    type: application
+    platform: tvOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.lightpanda.tvos.test
+    preBuildScripts:
+      - name: Build LightpandaTV (zig)
+        script: |
+          set -euo pipefail
+          REPO_ROOT="$SRCROOT/../.."
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          if [[ "${PLATFORM_NAME:-}" != "appletvsimulator" ]]; then
+            echo "Only tvOS simulator is supported by this script."
+            exit 1
+          fi
+          SDKROOT=$(xcrun --sdk appletvsimulator --show-sdk-path)
+          cat > /tmp/tvos-sim.libc <<EOF
+          include_dir=$SDKROOT/usr/include
+          sys_include_dir=$SDKROOT/usr/include
+          crt_dir=$SDKROOT/usr/lib
+          msvc_lib_dir=
+          kernel32_lib_dir=
+          gcc_dir=
+          EOF
+          cd "$REPO_ROOT"
+          /tmp/zig-0.15.2/zig build --sysroot "$SDKROOT" --libc /tmp/tvos-sim.libc -Dtarget=aarch64-tvos-simulator -Doptimize=ReleaseFast -Dtvos_app
+    postBuildScripts:
+      - name: Replace executable with LightpandaTV
+        script: |
+          set -euo pipefail
+          cp "$SRCROOT/../../zig-out/bin/LightpandaTV" "$TARGET_BUILD_DIR/$EXECUTABLE_PATH"

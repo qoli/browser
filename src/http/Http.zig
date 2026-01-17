@@ -375,6 +375,16 @@ fn loadCerts(allocator: Allocator, arena: Allocator) !c.curl_blob {
 
     const bytes = bundle.bytes.items;
     if (bytes.len == 0) {
+        const bundled = @embedFile("../data/ca-bundle.pem");
+        if (bundled.len > 0) {
+            log.warn(.app, "use bundled certs", .{});
+            return .{
+                .len = bundled.len,
+                .flags = 0,
+                .data = @ptrCast(@constCast(bundled.ptr)),
+            };
+        }
+
         log.warn(.app, "No system certificates", .{});
         return .{
             .len = 0,

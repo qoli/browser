@@ -382,7 +382,8 @@ fn buildV8(
             try gn_args.appendSlice(allocator, "v8_enable_pointer_compression=false\n");
             try gn_args.appendSlice(allocator, "v8_enable_webassembly=false\n");
             try gn_args.appendSlice(allocator, "v8_use_perfetto=false\n");
-            try gn_args.appendSlice(allocator, "target_environment=\"device\"\n");
+            const target_env = if (target.result.abi == .simulator) "simulator" else "device";
+            try gn_args.appendSlice(allocator, b.fmt("target_environment=\"{s}\"\n", .{target_env}));
             try gn_args.appendSlice(allocator, "target_platform=\"tvos\"\n");
             try gn_args.appendSlice(allocator, "use_blink=true\n");
         },

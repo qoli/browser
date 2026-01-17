@@ -42,15 +42,23 @@ pub fn main() !void {
     defer main_arena_instance.deinit();
 
     var sighandler = SigHandler{ .arena = main_arena };
-    try sighandler.install();
+    const enable_signals = builtin.os.tag != .tvos and builtin.os.tag != .ios;
+    if (enable_signals) {
+        try sighandler.install();
+    }
 
-    run(gpa, main_arena, &sighandler) catch |err| {
+    run(gpa, main_arena, &sighandler, enable_signals) catch |err| {
         log.fatal(.app, "exit", .{ .err = err });
         std.posix.exit(1);
     };
 }
 
-fn run(allocator: Allocator, main_arena: Allocator, sighandler: *SigHandler) !void {
+fn run(
+    allocator: Allocator,
+    main_arena: Allocator,
+    sighandler: *SigHandler,
+    enable_signals: bool,
+) !void {
     const args = try parseArgs(main_arena);
 
     switch (args.mode) {
@@ -111,7 +119,9 @@ fn run(allocator: Allocator, main_arena: Allocator, sighandler: *SigHandler) !vo
             var server = try lp.Server.init(app, address);
             defer server.deinit();
 
-            try sighandler.on(lp.Server.stop, .{&server});
+            if (enable_signals) {
+                try sighandler.on(lp.Server.stop, .{&server});
+            }
 
             // max timeout of 1 week.
             const timeout = if (opts.timeout > 604_800) 604_800_000 else @as(u32, opts.timeout) * 1000;

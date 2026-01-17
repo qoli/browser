@@ -31,6 +31,7 @@ pub fn build(b: *Build) !void {
     const prebuilt_v8_path = b.option([]const u8, "prebuilt_v8_path", "Path to prebuilt libc_v8.a");
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
     const force_static = b.option(bool, "static", "Build fully static executables") orelse false;
+    const build_tvos_app = b.option(bool, "tvos_app", "Build tvOS wrapper app") orelse false;
 
     var opts = b.addOptions();
     opts.addOption([]const u8, "version", manifest.version);
@@ -176,6 +177,60 @@ pub fn build(b: *Build) !void {
         const run_step = b.step("wpt", "Run WPT tests");
         run_step.dependOn(&run_cmd.step);
     }
+
+    if (build_tvos_app and target.result.os.tag == .tvos) {
+        const exe = b.addExecutable(.{
+            .name = "LightpandaTV",
+            .use_llvm = true,
+            .linkage = null,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/tvos_entry.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .link_libcpp = true,
+                .imports = &.{
+                    .{ .name = "lightpanda", .module = lightpanda_module },
+                },
+            }),
+        });
+        exe.entry = .disabled;
+
+        exe.root_module.addIncludePath(b.path("tvos"));
+        exe.root_module.addCSourceFiles(.{
+            .files = &.{
+                "tvos/main.m",
+                "tvos/AppDelegate.m",
+                "tvos/SceneDelegate.m",
+            },
+            .flags = &.{
+                "-fobjc-arc",
+            },
+        });
+
+        if (b.sysroot) |sysroot| {
+            const frameworks_path = b.fmt("{s}/System/Library/Frameworks", .{sysroot});
+            const subframeworks_path = b.fmt("{s}/System/Library/SubFrameworks", .{sysroot});
+            exe.root_module.addSystemFrameworkPath(.{ .cwd_relative = frameworks_path });
+            exe.root_module.addSystemFrameworkPath(.{ .cwd_relative = subframeworks_path });
+        } else {
+            const sdkroot = std.process.getEnvVarOwned(b.allocator, "SDKROOT") catch null;
+            if (sdkroot) |root| {
+                defer b.allocator.free(root);
+                const frameworks_path = b.fmt("{s}/System/Library/Frameworks", .{root});
+                const subframeworks_path = b.fmt("{s}/System/Library/SubFrameworks", .{root});
+                exe.root_module.addSystemFrameworkPath(.{ .cwd_relative = frameworks_path });
+                exe.root_module.addSystemFrameworkPath(.{ .cwd_relative = subframeworks_path });
+            }
+        }
+
+        exe.root_module.linkFramework("UIKit", .{});
+        exe.root_module.linkFramework("Foundation", .{});
+        exe.root_module.linkFramework("CoreGraphics", .{});
+        exe.root_module.linkFramework("QuartzCore", .{});
+
+        b.installArtifact(exe);
+    }
 }
 
 fn addDependencies(b: *Build, mod: *Build.Module, opts: *Build.Step.Options, prebuilt_v8_path: ?[]const u8) !void {
@@ -215,7 +270,7 @@ fn addDependencies(b: *Build, mod: *Build.Module, opts: *Build.Step.Options, pre
                 else => null,
             },
             .tvos => switch (target.result.cpu.arch) {
-                .aarch64 => "aarch64-apple-tvos",
+                .aarch64 => if (target.result.abi == .simulator) "aarch64-apple-tvos-sim" else "aarch64-apple-tvos",
                 .x86_64 => "x86_64-apple-tvos",
                 else => null,
             },
